@@ -39,3 +39,26 @@
 
 # debug information files
 *.dwo
+
+# Visual Studio и кэш
+.vs/
+[Bb]in/
+[Oo]bj/
+[Xx]64/
+[Xx]86/
+Generated\ Files/
+
+# Файлы базы данных IntelliSense (самые тяжелые)
+*.db
+*.opendb
+*.vc.db
+
+# Настройки пользователя (там твои локальные пути)
+*.user
+*.suo
+*.sln.docstates
+
+# Логи и временные файлы сборки
+*.log
+*.tlog
+*.lastbuildstate
