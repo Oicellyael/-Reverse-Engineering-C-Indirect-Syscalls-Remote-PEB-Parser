@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Game external exploration/Game external exploration.vcxproj" Id="e7762839-09c5-4760-8bf9-06ab59f0543d" />
+</Solution>
