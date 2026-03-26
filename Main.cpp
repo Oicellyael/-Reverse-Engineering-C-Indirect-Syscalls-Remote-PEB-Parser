@@ -1,15 +1,79 @@
-﻿#pragma comment(lib, "d3d11.lib")
-#include "help/help.h"
+#pragma comment(lib, "d3d11.lib")
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <chrono>
-#include < winternl.h >
 #include < cctype >
 #include <ctype.h>
 #include "asm.h"
+#include <d3d11.h>
+#include <tlhelp32.h>
 
 using namespace std;
+
+typedef LONG NTSTATUS;
+
+typedef struct _OBJECT_ATTRIBUTES {
+    ULONG Length;
+    HANDLE RootDirectory;
+    PVOID ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, * POBJECT_ATTRIBUTES;
+
+typedef struct _CLIENT_ID {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} CLIENT_ID, * PCLIENT_ID;
+
+typedef NTSTATUS(NTAPI* f_NtOpenProcess)(
+    PHANDLE            ProcessHandle,
+    ACCESS_MASK        DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PCLIENT_ID         ClientId
+    );
+
+typedef NTSTATUS(NTAPI* f_NtReadVirtualMemory)(
+    HANDLE      ProcessHandle,
+    PVOID       BaseAddress,
+    PVOID       Buffer,
+    SIZE_T      BufferSize,
+    PSIZE_T     NumberOfBytesRead
+    );
+
+typedef NTSTATUS(NTAPI* f_NtWriteVirtualMemory)(
+    HANDLE      ProcessHandle,
+    PVOID       BaseAddress,
+    PVOID       Buffer,
+    SIZE_T      BufferSize,
+    PSIZE_T     NumberOfBytesWritten
+    );
+
+typedef enum _SYSTEM_INFORMATION_CLASS {
+    SystemProcessInformation = 5
+} SYSTEM_INFORMATION_CLASS;
+
+typedef NTSTATUS(NTAPI* f_NtQuerySystemInformation)(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID                    SystemInformation,
+    ULONG                    SystemInformationLength,
+    PULONG                   ReturnLength
+    );
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING;
+
+typedef struct _SYSTEM_PROCESS_INFORMATION {
+    ULONG NextEntryOffset;     
+    ULONG NumberOfThreads;
+    BYTE Reserved1[48];
+    UNICODE_STRING ImageName;    
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+} SYSTEM_PROCESS_INFORMATION, * PSYSTEM_PROCESS_INFORMATION;
 
 DWORD MyHasher(const char* word) {
     DWORD hash = 4291;
@@ -85,28 +149,30 @@ int main() {
     uintptr_t ntOpen = GetFunctionAddress(0x3F4DD136);
     uintptr_t pNtRead = GetFunctionAddress(0x307C3661);
     uintptr_t pNtWrite = GetFunctionAddress(0xFAE162D0);
-    //uintptr_t realAddr = (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcess");
-    //uintptr_t realAddr2 = (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtReadVirtualMemory");
-    //uintptr_t realAddr3 = (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWriteVirtualMemory");
-    //Hash NtReadVirtualMemory is : 0x307C3661
-    //Hash NtWriteVirtualMemory is : 0xFAE162D0
+    uintptr_t pNtSysInfo = GetFunctionAddress(0x684921E6);
 
+    f_NtOpenProcess _NtOpenProcess;
+    f_NtReadVirtualMemory _NtReadVirtualMemory;
+    f_NtWriteVirtualMemory _NtWriteVirtualMemory;
+    _NtOpenProcess = (f_NtOpenProcess)ntOpen;
+    _NtReadVirtualMemory = (f_NtReadVirtualMemory)pNtRead;
+    _NtWriteVirtualMemory = (f_NtWriteVirtualMemory)pNtWrite;
 
-    // Теперь передаем все 3 значения для 3-х спецификаторов (%p, %p, %s)
-    /*printf("My: NtOpenProcess %p | Real: %p | Match: %s\n",
-        (void*)myAddr,
-        (void*)realAddr,
-        (myAddr == realAddr) ? "YES" : "NO");
-    printf("My:NtReadVirtualMemory %p | Real: %p | Match: %s\n",
-        (void*)pNtRead,
-        (void*)realAddr2,
-        (pNtRead == realAddr2) ? "YES" : "NO");
-    printf("My:NtWriteVirtualMemory %p | Real: %p | Match: %s\n",
-        (void*)pNtWrite,
-        (void*)realAddr3,
-        (pNtWrite == realAddr3) ? "YES" : "NO");*/
-    while (!GetAsyncKeyState(VK_DELETE)) {
-    }
-    return 0;
-    
+    void* buffer = malloc(size_t(buffer));
+    PSYSTEM_PROCESS_INFORMATION pСurrent = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    DWORD targetPid = 0;
+
+    do {
+        pСurrent = (PSYSTEM_PROCESS_INFORMATION)((uintptr_t)pСurrent + pСurrent->NextEntryOffset);
+        if (pСurrent->ImageName.Buffer != NULL) {
+            if (_wcsicmp(pСurrent->ImageName.Buffer, L"cs2.exe") == 0) {
+                targetPid = (DWORD)pСurrent->UniqueProcessId;
+                break;
+            }
+
+        }
+    } while (pСurrent->NextEntryOffset);
+    free(buffer);
+    while (!GetAsyncKeyState(VK_DELETE)) {}
+    return 0;  
 }
