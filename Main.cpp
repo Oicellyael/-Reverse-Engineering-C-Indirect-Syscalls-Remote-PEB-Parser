@@ -13,8 +13,15 @@ using namespace std;
 
 const BYTE expected[] = { 0x4C, 0x8B, 0xD1, 0xB8 };
 uintptr_t g_ntOpen = 0;
+
 extern "C" DWORD g_ssn = 0;
+extern "C" DWORD g_ssn_read = 0;
+extern "C" DWORD g_ssn_write = 0;
 extern "C" uintptr_t g_syscallAddr = 0;
+extern "C" DWORD g_ssn_thread = 0;
+extern "C" DWORD g_ssn_QSI = 0;
+extern "C" DWORD g_ssn_QIP = 0;
+
 
 typedef LONG NTSTATUS;
 
@@ -59,7 +66,7 @@ typedef enum _SYSTEM_INFORMATION_CLASS {
     SystemProcessInformation = 5
 } SYSTEM_INFORMATION_CLASS;
 
-typedef NTSTATUS(NTAPI* f_NtQuerySystemInformation)(
+typedef NTSTATUS(NTAPI* f_NtQuerySystemInformation)( 
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
     PVOID                    SystemInformation,
     ULONG                    SystemInformationLength,
@@ -81,12 +88,77 @@ typedef struct _SYSTEM_PROCESS_INFORMATION {
     HANDLE UniqueProcessId;
 } SYSTEM_PROCESS_INFORMATION, * PSYSTEM_PROCESS_INFORMATION;
 
+typedef struct _PROCESS_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+	PVOID PebBaseAddress; // Адрес PEB процесса
+    ULONG_PTR AffinityMask;
+    LONG BasePriority;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION;
+
 extern "C" NTSTATUS Syscall_NtOpenProcess(
     PHANDLE ProcessHandle,
     ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes,
     PCLIENT_ID ClientId
 );
+
+extern "C" NTSTATUS Syscall_NtReadVirtualMemory(
+    HANDLE  ProcessHandle,
+    PVOID   BaseAddress,
+    PVOID   Buffer,
+    SIZE_T  BufferSize,
+    PSIZE_T NumberOfBytesRead
+);
+
+extern "C" NTSTATUS Syscall_NtWriteVirtualMemory(
+    HANDLE      ProcessHandle,
+    PVOID       BaseAddress,
+    PVOID       Buffer,
+    SIZE_T      BufferSize,
+    PSIZE_T     NumberOfBytesWritten
+);
+
+extern "C" NTSTATUS Syscall_NtCreateThreadEx(
+    PHANDLE ThreadHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    HANDLE ProcessHandle,
+    PVOID StartRoutine,
+    PVOID Argument,
+    ULONG CreateFlags,
+    ULONG_PTR ZeroBits,
+    SIZE_T StackSize,
+    SIZE_T MaximumStackSize,
+    PVOID AttributeList
+);
+
+extern "C" NTSTATUS Syscall_NtQuerySystemInformation(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID                    SystemInformation,
+    ULONG                    SystemInformationLength,
+    PULONG                   ReturnLength
+    );
+
+extern "C" NTSTATUS Syscall_NtQueryInformationProcess(
+    HANDLE ProcessHandle,
+    ULONG ProcessInformationClass, 
+    PVOID ProcessInformation,      
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength
+);
+
+typedef struct _LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;           // 0x00
+    LIST_ENTRY InMemoryOrderLinks;         // 0x10
+    LIST_ENTRY InInitializationOrderLinks;   // 0x20
+	PVOID DllBase;                         // 0x30 <- need this
+    PVOID EntryPoint;                      // 0x38
+    ULONG SizeOfImage;                     // 0x40
+    UNICODE_STRING FullDllName;            // 0x48
+	UNICODE_STRING BaseDllName;     // 0x58 <- need this
+} LDR_DATA_TABLE_ENTRY, * PLDR_DATA_TABLE_ENTRY;
 
 DWORD MyHasher(const char* word) {
     DWORD hash = 4291;
@@ -124,20 +196,34 @@ uintptr_t GetFunctionAddress(DWORD targetHash) {
 	return functionAddress;
 }
 
-bool Compare(uintptr_t address, BYTE*pattern) {
+DWORD GetSSN(uintptr_t address, const BYTE* pattern) {
     BYTE* mem = (BYTE*)address;
-    if (memcmp((void*)g_ntOpen, expected, 4) == 0) {
-         g_ssn = *(DWORD*)(g_ntOpen + 4);
-
-    }
-    for (size_t i = 0; i < 32; i++) {
-        if (mem[i] == 0x0F and mem[i + 1] == 0x05) {
-            g_syscallAddr = address + i;
-            break;
+    if (memcmp(mem, pattern, 4) == 0) {
+        for (size_t i = 0; i < 32; i++) {
+            if (mem[i] == 0x0F && mem[i + 1] == 0x05) {
+                g_syscallAddr = address + i;
+                break;
+            }
         }
+        return *(DWORD*)(address + 4);
     }
-    return true;
+    return 0; 
 }
+
+template <typename T>
+T Read(HANDLE hProc, uintptr_t address) {
+    T buffer;
+    Syscall_NtReadVirtualMemory(hProc, (PVOID)address, &buffer, sizeof(T), NULL); //Read<uintptr_t>(hProcess, clientBase + offsets);
+    return buffer;
+}
+template <typename T>
+bool Write(HANDLE hProc, uintptr_t address, T value) {
+    NTSTATUS status = Syscall_NtWriteVirtualMemory(hProc,(PVOID)address,&value,sizeof(T),NULL); //Write<bool>(hProcess, targetAddress(client+offsets), our bool) 
+    return (status == 0);
+}
+
+
+INPUT clicks[2] = {};
 
 int main() {
 
@@ -178,6 +264,8 @@ int main() {
     uintptr_t pNtRead = GetFunctionAddress(0x307C3661);
     uintptr_t pNtWrite = GetFunctionAddress(0xFAE162D0);
     uintptr_t pNtSysInfo = GetFunctionAddress(0x684921E6);
+    uintptr_t pNtCreateThreadEx = GetFunctionAddress(0xFE3E696E);
+    uintptr_t pNtQueryInformationProcess = GetFunctionAddress(0xA405E60);
 
     f_NtOpenProcess _NtOpenProcess;
     f_NtReadVirtualMemory _NtReadVirtualMemory;
@@ -195,7 +283,7 @@ int main() {
     PSYSTEM_PROCESS_INFORMATION pCurrent = (PSYSTEM_PROCESS_INFORMATION)buffer;
     DWORD targetPid = 0;
 
-    while (true){
+    while (true) {
         if (pCurrent->ImageName.Buffer != NULL) {
             if (_wcsicmp(pCurrent->ImageName.Buffer, L"cs2.exe") == 0) {
                 targetPid = (DWORD)pCurrent->UniqueProcessId;
@@ -220,31 +308,96 @@ int main() {
     oa.SecurityDescriptor = NULL;
     oa.SecurityQualityOfService = NULL;
 
-    HANDLE hProcess = 0;
     g_ntOpen = ntOpen;
-    Compare(ntOpen, (BYTE*)expected);
-    NTSTATUS status = Syscall_NtOpenProcess(&hProcess, 0x1038, &oa, &cid);
-    cout << hex << status << endl;
-    
-    uintptr_t realAddr2 = (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcess");
-    printf("My: _NtOpenProcess %p | Real: %p | Match: %s\n",
-        (void*)ntOpen,
-        (void*)realAddr2,
-        (ntOpen == realAddr2) ? "YES" : "NO");
-    printf("Found SSN: 0x%X\n", g_ssn);
-    printf("Found Syscall Address: %p\n", (void*)g_syscallAddr);
+    g_ssn = GetSSN(ntOpen, expected);
+    g_ssn_read = GetSSN(pNtRead, expected);
+    g_ssn_write = GetSSN(pNtWrite, expected);
+    g_ssn_QSI = GetSSN(pNtSysInfo, expected);
+    g_ssn_thread = GetSSN(pNtCreateThreadEx, expected);
+    g_ssn_QIP = GetSSN(pNtQueryInformationProcess, expected);
 
-    printf("\n--- SYSCALL CHECK ---\n");
-    printf("Status: 0x%X\n", status);
-    printf("Handle: %p\n", hProcess);
+    DWORD dwDesiredAccess = 0x0438;
+    HANDLE hProcess = 0;
+    NTSTATUS status = Syscall_NtOpenProcess(&hProcess, dwDesiredAccess, &oa, &cid);
 
-    if (status == 0 && hProcess != NULL) {
-        printf("Peremoga! Syscall worked, handle is valid.\n");
-    }
-    else {
-        printf("Zrada... Check your SSN or Admin rights.\n");
+    PROCESS_BASIC_INFORMATION pbi;
+    NTSTATUS qipStatus = Syscall_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), NULL);
+    uintptr_t remoteLdr = 0;
+    NTSTATUS readStatus = Syscall_NtReadVirtualMemory(hProcess, (PVOID)((uintptr_t)pbi.PebBaseAddress + 0x18), &remoteLdr, sizeof(remoteLdr), NULL);
+    if (readStatus == 0) {
+        printf("Ldr found at: %p\n", (void*)remoteLdr);
     }
 
-    while (!GetAsyncKeyState(VK_DELETE)) {}
-    return 0;  
+    uintptr_t listHeadAddr = remoteLdr + 0x10;
+    uintptr_t currentEntry = 0;
+    readStatus = Syscall_NtReadVirtualMemory(hProcess, (PVOID)listHeadAddr, &currentEntry, sizeof(currentEntry), NULL);
+    uintptr_t clientBase = 0;
+
+    while (currentEntry != listHeadAddr) {
+        LDR_DATA_TABLE_ENTRY entry;
+        readStatus = Syscall_NtReadVirtualMemory(hProcess, (PVOID)currentEntry, &entry, sizeof(entry), NULL);
+        if (readStatus == 0) {
+            wchar_t* dllName = (wchar_t*)malloc(entry.BaseDllName.Length + sizeof(wchar_t));
+            if (dllName) {
+                readStatus = Syscall_NtReadVirtualMemory(hProcess, entry.BaseDllName.Buffer, dllName, entry.BaseDllName.Length, NULL);
+                if (readStatus == 0) {
+                    dllName[entry.BaseDllName.Length / sizeof(wchar_t)] = L'\0';
+                    if (_wcsicmp(L"client.dll", dllName) == 0) {
+                        clientBase = (uintptr_t)entry.DllBase;
+                        printf("DOMINATION! client.dll found at: %p\n", entry.DllBase);
+                        free(dllName);
+                        break;
+                    }
+                }
+                free(dllName);
+            }
+        }
+        currentEntry = (uintptr_t)entry.InLoadOrderLinks.Flink;
+        if (currentEntry == 0) break;
+    }
+    //Read<uintptr_t>(hProcess, clientBase + offsets);
+    //Write<bool>(hProcess, targetAddress(client+offsets), our bool) 
+    while (!GetAsyncKeyState(VK_DELETE)) {
+
+        if (clientBase != 0) {
+            uintptr_t localController = Read<uintptr_t>(hProcess, clientBase + 0x22F5028);
+            uintptr_t localPawn = Read<uintptr_t>(hProcess, clientBase + 0x206A9E0);
+
+            if (localController != 0 && localPawn != 0) {
+                int localHp = Read<int>(hProcess, localPawn + 0x354);
+                
+                system("cls");
+                printf("================================================================\n");
+                printf("        INDIRECT SYSCALLS ENGINE v1.0 - CS2 EXPLORATION         \n");
+                printf("================================================================\n");
+
+                printf("[*] LOCAL ENVIRONMENT:\n");
+                printf("    |-> PEB Address:       0x%p\n", (void*)pebBase);
+                printf("    |-> NTDLL Base:        0x%p\n", (void*)NTDLL::ntBase);
+                printf("    |-> Syscall Jump Addr: 0x%p\n", (void*)g_syscallAddr);
+
+                printf("\n[*] SYSTEM SERVICE NUMBERS (SSN) FOUND:\n");
+                printf("    |-> NtOpenProcess:     [0x%04X]\n", g_ssn);
+                printf("    |-> NtReadVirtualMem:  [0x%04X]\n", g_ssn_read);
+                printf("    |-> NtWriteVirtualMem: [0x%04X]\n", g_ssn_write);
+                printf("    |-> NtQuerySystemInfo: [0x%04X]\n", g_ssn_QSI);
+                printf("    |-> NtQueryInfoProc:   [0x%04X]\n", g_ssn_QIP);
+
+                printf("\n[*] TARGET PROCESS (PID: %d):\n", targetPid);
+                printf("    |-> Access Mask:       0x%04X (STEALTH)\n", dwDesiredAccess);
+                printf("    |-> Remote PEB:        0x%p\n", pbi.PebBaseAddress);
+                printf("    |-> Remote LDR:        0x%p\n", (void*)remoteLdr);
+
+                printf("\n[*] MODULE MAPPING:\n");
+                printf("    |-> Found Module:      [client.dll]\n");
+                printf("    |-> Base Address:      0x%p\n", (void*)clientBase);
+
+                printf("\n[+] LIVE GAME DATA:\n");
+                printf("    |- LocalController:    0x%p\n", (void*)localController);
+                printf("    |- LocalPawn:          0x%p\n", (void*)localPawn);
+                printf("    |- Current HP:         %d\n", localHp);
+            }
+        }
+    }
+    return 0;
 }
