@@ -8,7 +8,9 @@ EXTERN g_ssn_write:DWORD
 EXTERN g_ssn_thread:DWORD
 EXTERN g_ssn_QSI:DWORD
 EXTERN g_ssn_QIP:DWORD
-
+EXTERN g_ssn_allocate:DWORD
+EXTERN g_ssn_free:DWORD
+EXTERN g_ssn_protect:DWORD
 
 .code
 
@@ -53,5 +55,23 @@ Syscall_NtQueryInformationProcess PROC
     mov eax, g_ssn_QIP
     jmp qword ptr [g_syscallAddr]
 Syscall_NtQueryInformationProcess ENDP
+
+Syscall_NtAllocateVirtualMemory PROC
+    mov r10, rcx                
+    mov eax, g_ssn_allocate     
+    jmp qword ptr [g_syscallAddr] 
+Syscall_NtAllocateVirtualMemory ENDP
+
+Syscall_NtFreeVirtualMemory PROC
+    mov r10, rcx
+    mov eax, g_ssn_free     
+    jmp qword ptr [g_syscallAddr]
+Syscall_NtFreeVirtualMemory ENDP
+
+Syscall_NtProtectVirtualMemory PROC
+    mov r10, rcx
+    mov eax, g_ssn_protect  
+    jmp qword ptr [g_syscallAddr]
+Syscall_NtProtectVirtualMemory ENDP
 
 END
