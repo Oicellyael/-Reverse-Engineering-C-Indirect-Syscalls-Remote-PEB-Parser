@@ -3,7 +3,7 @@
 #include <string>
 #include <windows.h>
 #include <chrono>
-#include < cctype >
+#include <cctype>
 #include <ctype.h>
 #include "asm.h"
 #include <d3d11.h>
@@ -12,216 +12,6 @@
 using namespace std;
 
 const BYTE expected[] = { 0x4C, 0x8B, 0xD1, 0xB8 };
-uintptr_t g_ntOpen = 0;
-
-extern "C" DWORD g_ssn = 0;
-extern "C" DWORD g_ssn_read = 0;
-extern "C" DWORD g_ssn_write = 0;
-extern "C" uintptr_t g_syscallAddr = 0;
-extern "C" DWORD g_ssn_thread = 0;
-extern "C" DWORD g_ssn_QSI = 0;
-extern "C" DWORD g_ssn_QIP = 0;
-
-
-typedef LONG NTSTATUS;
-
-typedef struct _OBJECT_ATTRIBUTES {
-    ULONG Length;
-    HANDLE RootDirectory;
-    PVOID ObjectName;
-    ULONG Attributes;
-    PVOID SecurityDescriptor;
-    PVOID SecurityQualityOfService;
-} OBJECT_ATTRIBUTES, * POBJECT_ATTRIBUTES;
-
-typedef struct _CLIENT_ID {
-    HANDLE UniqueProcess;
-    HANDLE UniqueThread;
-} CLIENT_ID, * PCLIENT_ID;
-
-typedef NTSTATUS(NTAPI* f_NtOpenProcess)(
-    PHANDLE            ProcessHandle,
-    ACCESS_MASK        DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PCLIENT_ID         ClientId
-    );
-
-typedef NTSTATUS(NTAPI* f_NtReadVirtualMemory)(
-    HANDLE      ProcessHandle,
-    PVOID       BaseAddress,
-    PVOID       Buffer,
-    SIZE_T      BufferSize,
-    PSIZE_T     NumberOfBytesRead
-    );
-
-typedef NTSTATUS(NTAPI* f_NtWriteVirtualMemory)(
-    HANDLE      ProcessHandle,
-    PVOID       BaseAddress,
-    PVOID       Buffer,
-    SIZE_T      BufferSize,
-    PSIZE_T     NumberOfBytesWritten
-    );
-
-typedef enum _SYSTEM_INFORMATION_CLASS {
-    SystemProcessInformation = 5
-} SYSTEM_INFORMATION_CLASS;
-
-typedef NTSTATUS(NTAPI* f_NtQuerySystemInformation)( 
-    SYSTEM_INFORMATION_CLASS SystemInformationClass,
-    PVOID                    SystemInformation,
-    ULONG                    SystemInformationLength,
-    PULONG                   ReturnLength
-    );
-
-typedef struct _UNICODE_STRING {
-    USHORT Length;
-    USHORT MaximumLength;
-    PWSTR  Buffer;
-} UNICODE_STRING;
-
-typedef struct _SYSTEM_PROCESS_INFORMATION {
-    ULONG NextEntryOffset;     
-    ULONG NumberOfThreads;
-    BYTE Reserved1[48];
-    UNICODE_STRING ImageName;    
-    LONG BasePriority;
-    HANDLE UniqueProcessId;
-} SYSTEM_PROCESS_INFORMATION, * PSYSTEM_PROCESS_INFORMATION;
-
-typedef struct _PROCESS_BASIC_INFORMATION {
-    NTSTATUS ExitStatus;
-	PVOID PebBaseAddress; // Адрес PEB процесса
-    ULONG_PTR AffinityMask;
-    LONG BasePriority;
-    ULONG_PTR UniqueProcessId;
-    ULONG_PTR InheritedFromUniqueProcessId;
-} PROCESS_BASIC_INFORMATION;
-
-extern "C" NTSTATUS Syscall_NtOpenProcess(
-    PHANDLE ProcessHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PCLIENT_ID ClientId
-);
-
-extern "C" NTSTATUS Syscall_NtReadVirtualMemory(
-    HANDLE  ProcessHandle,
-    PVOID   BaseAddress,
-    PVOID   Buffer,
-    SIZE_T  BufferSize,
-    PSIZE_T NumberOfBytesRead
-);
-
-extern "C" NTSTATUS Syscall_NtWriteVirtualMemory(
-    HANDLE      ProcessHandle,
-    PVOID       BaseAddress,
-    PVOID       Buffer,
-    SIZE_T      BufferSize,
-    PSIZE_T     NumberOfBytesWritten
-);
-
-extern "C" NTSTATUS Syscall_NtCreateThreadEx(
-    PHANDLE ThreadHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    HANDLE ProcessHandle,
-    PVOID StartRoutine,
-    PVOID Argument,
-    ULONG CreateFlags,
-    ULONG_PTR ZeroBits,
-    SIZE_T StackSize,
-    SIZE_T MaximumStackSize,
-    PVOID AttributeList
-);
-
-extern "C" NTSTATUS Syscall_NtQuerySystemInformation(
-    SYSTEM_INFORMATION_CLASS SystemInformationClass,
-    PVOID                    SystemInformation,
-    ULONG                    SystemInformationLength,
-    PULONG                   ReturnLength
-    );
-
-extern "C" NTSTATUS Syscall_NtQueryInformationProcess(
-    HANDLE ProcessHandle,
-    ULONG ProcessInformationClass, 
-    PVOID ProcessInformation,      
-    ULONG ProcessInformationLength,
-    PULONG ReturnLength
-);
-
-typedef struct _LDR_DATA_TABLE_ENTRY {
-    LIST_ENTRY InLoadOrderLinks;           // 0x00
-    LIST_ENTRY InMemoryOrderLinks;         // 0x10
-    LIST_ENTRY InInitializationOrderLinks;   // 0x20
-	PVOID DllBase;                         // 0x30 <- need this
-    PVOID EntryPoint;                      // 0x38
-    ULONG SizeOfImage;                     // 0x40
-    UNICODE_STRING FullDllName;            // 0x48
-	UNICODE_STRING BaseDllName;     // 0x58 <- need this
-} LDR_DATA_TABLE_ENTRY, * PLDR_DATA_TABLE_ENTRY;
-
-DWORD MyHasher(const char* word) {
-    DWORD hash = 4291;
-    int c;
-    while ((c = *word++)) {
-        if (isupper(c)) {
-            c = c + 32;
-        }
-        hash = ((hash << 5) + hash) + c;
-    }
-    return hash;
-}
-
-uintptr_t GetFunctionAddress(DWORD targetHash) {
-	DWORD PeStart = *(DWORD*)(NTDLL::ntBase + 0x3C);// Получаем смещение к PE заголовку
-	DWORD exportRVA = *(DWORD*)(NTDLL::ntBase + PeStart + 0x88);// Получаем RVA к экспортной таблице РВА (Relative Virtual Address) - это смещение от базового адреса модуля до определенного элемента, такого как функция или переменная.    
-	uintptr_t EDAddress = NTDLL::ntBase + exportRVA; // Получаем адрес экспортной таблицы
-	DWORD numNames = *(DWORD*)(EDAddress + 0x18);// Получаем количество имен экспортируемых функций
-	uintptr_t functionAddress = 0;// Адрес искомой функции
-	uintptr_t namesAddr = NTDLL::ntBase + *(DWORD*)(EDAddress + 0x20);// Получаем адрес массива имен экспортируемых функций
-	uintptr_t ordinalsAddr = NTDLL::ntBase + *(DWORD*)(EDAddress + 0x24);// Получаем адрес массива порядковых номеров экспортируемых функций
-	uintptr_t functionsAddr = NTDLL::ntBase + *(DWORD*)(EDAddress + 0x1C);// Получаем адрес массива адресов экспортируемых функций
-	DWORD nameRVA = 0;// RVA к имени функции
-    for (DWORD i = 0; i < numNames; i++) {
-        DWORD name =*(DWORD*)(namesAddr + i * 4); // 
-       char* namestr= (char*)(NTDLL::ntBase + name);
-      DWORD target= MyHasher(namestr);
-        if (target == targetHash) {
-			WORD ordinal = *(WORD*)(ordinalsAddr + i * 2);// Получаем порядковый номер функции
-			DWORD functionRVA =*(DWORD*)( functionsAddr+ (ordinal*4));// Получаем порядковый номер функции, добавив базовый порядковый номер
-			functionAddress = NTDLL::ntBase + functionRVA;// Получаем адрес функции, добавив базовый адрес модуля
-            break;
-        }
-    }
-	return functionAddress;
-}
-
-DWORD GetSSN(uintptr_t address, const BYTE* pattern) {
-    BYTE* mem = (BYTE*)address;
-    if (memcmp(mem, pattern, 4) == 0) {
-        for (size_t i = 0; i < 32; i++) {
-            if (mem[i] == 0x0F && mem[i + 1] == 0x05) {
-                g_syscallAddr = address + i;
-                break;
-            }
-        }
-        return *(DWORD*)(address + 4);
-    }
-    return 0; 
-}
-
-template <typename T>
-T Read(HANDLE hProc, uintptr_t address) {
-    T buffer;
-    Syscall_NtReadVirtualMemory(hProc, (PVOID)address, &buffer, sizeof(T), NULL); //Read<uintptr_t>(hProcess, clientBase + offsets);
-    return buffer;
-}
-template <typename T>
-bool Write(HANDLE hProc, uintptr_t address, T value) {
-    NTSTATUS status = Syscall_NtWriteVirtualMemory(hProc,(PVOID)address,&value,sizeof(T),NULL); //Write<bool>(hProcess, targetAddress(client+offsets), our bool) 
-    return (status == 0);
-}
-
 
 INPUT clicks[2] = {};
 
@@ -254,7 +44,7 @@ int main() {
         printf("NTDLL not found!\n");
     }
     unsigned short target = *(unsigned short*)NTDLL::ntBase;
-    if (target == 0x5A4D) { // 'M' и 'Z'
+    if (target == 0x5A4D) {
         printf("Signature confirmed: MZ is here!\n");
     }
     else {
@@ -267,10 +57,31 @@ int main() {
     uintptr_t pNtCreateThreadEx = GetFunctionAddress(0xFE3E696E);
     uintptr_t pNtQueryInformationProcess = GetFunctionAddress(0xA405E60);
 
+	uintptr_t pNtVirtualAllocEx = GetFunctionAddress(0xC86105CA);
+	uintptr_t pNtVirtualFreeEx = GetFunctionAddress(0xB5567B67);
+	uintptr_t NtProtectVirtualEx = GetFunctionAddress(0xA4D0D586);
+
+    //uintptr_t realAddr2 = (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtAllocateVirtualMemory");
+    //uintptr_t realAddr3 = (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtFreeVirtualMemory");
+    //uintptr_t realAddr4 = (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtProtectVirtualMemory");
+    //printf("My: NtAllocateVirtualMemory %p | Real: %p | Match: %s\n",
+    //    (void*)pNtVirtualAllocEx,
+    //    (void*)realAddr2,
+    //    (pNtVirtualAllocEx == realAddr2) ? "YES" : "NO");
+    //printf("My:NtFreeVirtualMemory %p | Real: %p | Match: %s\n",
+    //    (void*)pNtVirtualFreeEx,
+    //    (void*)realAddr3,
+    //    (pNtVirtualFreeEx == realAddr3) ? "YES" : "NO");
+    //printf("My:NtProtectVirtualMemory %p | Real: %p | Match: %s\n",
+    //    (void*)NtProtectVirtualEx,
+    //    (void*)realAddr4,
+    //    (NtProtectVirtualEx == realAddr4) ? "YES" : "NO");
+	
     f_NtOpenProcess _NtOpenProcess;
     f_NtReadVirtualMemory _NtReadVirtualMemory;
     f_NtWriteVirtualMemory _NtWriteVirtualMemory;
     f_NtQuerySystemInformation _NtQuerySystemInformation;
+
     _NtOpenProcess = (f_NtOpenProcess)ntOpen;
     _NtReadVirtualMemory = (f_NtReadVirtualMemory)pNtRead;
     _NtWriteVirtualMemory = (f_NtWriteVirtualMemory)pNtWrite;
@@ -280,6 +91,7 @@ int main() {
     _NtQuerySystemInformation(SystemProcessInformation, NULL, 0, &bufferSize);
     void* buffer = malloc(size_t(bufferSize));
     _NtQuerySystemInformation(SystemProcessInformation, buffer, bufferSize, &bufferSize);
+    
     PSYSTEM_PROCESS_INFORMATION pCurrent = (PSYSTEM_PROCESS_INFORMATION)buffer;
     DWORD targetPid = 0;
 
@@ -297,11 +109,11 @@ int main() {
     free(buffer);
 
     CLIENT_ID cid = { 0 };
-    cid.UniqueProcess = (HANDLE)(uintptr_t)targetPid; // Превращаем число с dword into 8 byte
+    cid.UniqueProcess = (HANDLE)(uintptr_t)targetPid;
     cid.UniqueThread = 0;
 
     OBJECT_ATTRIBUTES oa;
-    oa.Length = sizeof(OBJECT_ATTRIBUTES); // need for NtOpenprocess
+    oa.Length = sizeof(OBJECT_ATTRIBUTES);
     oa.RootDirectory = NULL;
     oa.Attributes = 0;
     oa.ObjectName = NULL;
@@ -315,6 +127,9 @@ int main() {
     g_ssn_QSI = GetSSN(pNtSysInfo, expected);
     g_ssn_thread = GetSSN(pNtCreateThreadEx, expected);
     g_ssn_QIP = GetSSN(pNtQueryInformationProcess, expected);
+	g_ssn_allocate = GetSSN(pNtVirtualAllocEx, expected);
+    g_ssn_free= GetSSN(pNtVirtualFreeEx, expected);
+    g_ssn_protect= GetSSN(NtProtectVirtualEx, expected);
 
     DWORD dwDesiredAccess = 0x0438;
     HANDLE hProcess = 0;
@@ -355,10 +170,14 @@ int main() {
         currentEntry = (uintptr_t)entry.InLoadOrderLinks.Flink;
         if (currentEntry == 0) break;
     }
+	
     //Read<uintptr_t>(hProcess, clientBase + offsets);
     //Write<bool>(hProcess, targetAddress(client+offsets), our bool) 
-    while (!GetAsyncKeyState(VK_DELETE)) {
 
+    while (!GetAsyncKeyState(VK_DELETE)) {
+    }
+
+   /* while (!GetAsyncKeyState(VK_DELETE)) {
         if (clientBase != 0) {
             uintptr_t localController = Read<uintptr_t>(hProcess, clientBase + 0x22F5028);
             uintptr_t localPawn = Read<uintptr_t>(hProcess, clientBase + 0x206A9E0);
@@ -398,6 +217,6 @@ int main() {
                 printf("    |- Current HP:         %d\n", localHp);
             }
         }
-    }
+    }*/
     return 0;
 }
