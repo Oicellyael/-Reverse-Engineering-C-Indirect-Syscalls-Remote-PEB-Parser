@@ -14,6 +14,7 @@ extern "C" {
     DWORD g_ssn_allocate = 0;
     DWORD g_ssn_free = 0;
     DWORD g_ssn_protect=0;
+   DWORD g_ssn_duplicate = 0;
 }
 
 namespace NTDLL {
