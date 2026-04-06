@@ -11,7 +11,7 @@ EXTERN g_ssn_QIP:DWORD
 EXTERN g_ssn_allocate:DWORD
 EXTERN g_ssn_free:DWORD
 EXTERN g_ssn_protect:DWORD
-
+extern g_ssn_duplicate:DWORD
 .code
 
 GetMyPeb PROC
@@ -73,5 +73,16 @@ Syscall_NtProtectVirtualMemory PROC
     mov eax, g_ssn_protect  
     jmp qword ptr [g_syscallAddr]
 Syscall_NtProtectVirtualMemory ENDP
+
+GetMyProcessId PROC
+    mov rax, gs:[40h]  
+    ret
+GetMyProcessId ENDP
+
+Syscall_NtDuplicateObject PROC
+    mov r10, rcx
+    mov eax, g_ssn_duplicate
+    jmp qword ptr [g_syscallAddr]
+Syscall_NtDuplicateObject ENDP
 
 END
