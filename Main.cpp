@@ -1,429 +1,447 @@
 #pragma comment(lib, "d3d11.lib")
-#include <iostream>
-#include <string>
+#include "help/help.h"
 #include <windows.h>
-#include <chrono>
+
 #include <cctype>
-#include <ctype.h>
+#include <cstdio>
+#include <cstdlib>
+
 #include "asm.h"
-#include <d3d11.h>
-#include <tlhelp32.h>
 
-using namespace std;
+namespace {
 
-const BYTE expected[] = { 0x4C, 0x8B, 0xD1, 0xB8 };
+    constexpr BYTE kZwFunctionStub[] = { 0x4C, 0x8B, 0xD1, 0xB8 }; // mov r10, rcx ; mov eax, SSN
 
-INPUT clicks[2] = {};
+    // FNV-like export hashes (unchanged)
+    constexpr DWORD kNtOpenProcess = 0x3F4DD136;
+    constexpr DWORD kNtReadVirtualMemory = 0x307C3661;
+    constexpr DWORD kNtWriteVirtualMemory = 0xFAE162D0;
+    constexpr DWORD kNtQuerySystemInformation = 0x684921E6;
+    constexpr DWORD kNtCreateThreadEx = 0xFE3E696E;
+    constexpr DWORD kNtQueryInformationProcess = 0x0A405E60;
+    constexpr DWORD kNtAllocateVirtualMemory = 0xC86105CA;
+    constexpr DWORD kNtFreeVirtualMemory = 0xB5567B67;
+    constexpr DWORD kNtProtectVirtualMemory = 0xA4D0D586;
+    constexpr DWORD kNtDuplicateObject = 0x781AA9F7;
 
+    constexpr ACCESS_MASK kOpenProcessDesiredAccess = 0x0438;
+    constexpr ACCESS_MASK kDuplicateSameAccess = 0x2;
+    constexpr ACCESS_MASK kProcessFullControl = 0x1FFFFF;
 
-// Enables SE_DEBUG_NAME privilege to gain access to processes owned by other users
-bool EnableDebugPrivilege() {
-    HANDLE hToken;
-    LUID luid;
-    TOKEN_PRIVILEGES tp;
+    constexpr NTSTATUS kNtStatusBufferTooSmall = 0xC0000004L;
 
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-        return false;
+    struct NtRoutines {
+        uintptr_t ntOpenProcess = 0;
+        uintptr_t ntReadVirtualMemory = 0;
+        uintptr_t ntWriteVirtualMemory = 0;
+        uintptr_t ntQuerySystemInformation = 0;
+        uintptr_t ntCreateThreadEx = 0;
+        uintptr_t ntQueryInformationProcess = 0;
+        uintptr_t ntAllocateVirtualMemory = 0;
+        uintptr_t ntFreeVirtualMemory = 0;
+        uintptr_t ntProtectVirtualMemory = 0;
+        uintptr_t ntDuplicateObject = 0;
+    };
 
-    if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid)) {
+    bool ResolveNtRoutines(NtRoutines& out) {
+        out.ntOpenProcess = GetFunctionAddress(kNtOpenProcess);
+        out.ntReadVirtualMemory = GetFunctionAddress(kNtReadVirtualMemory);
+        out.ntWriteVirtualMemory = GetFunctionAddress(kNtWriteVirtualMemory);
+        out.ntQuerySystemInformation = GetFunctionAddress(kNtQuerySystemInformation);
+        out.ntCreateThreadEx = GetFunctionAddress(kNtCreateThreadEx);
+        out.ntQueryInformationProcess = GetFunctionAddress(kNtQueryInformationProcess);
+        out.ntAllocateVirtualMemory = GetFunctionAddress(kNtAllocateVirtualMemory);
+        out.ntFreeVirtualMemory = GetFunctionAddress(kNtFreeVirtualMemory);
+        out.ntProtectVirtualMemory = GetFunctionAddress(kNtProtectVirtualMemory);
+        out.ntDuplicateObject = GetFunctionAddress(kNtDuplicateObject);
+
+        return out.ntOpenProcess != 0 &&
+            out.ntReadVirtualMemory != 0 &&
+            out.ntWriteVirtualMemory != 0 &&
+            out.ntQuerySystemInformation != 0 &&
+            out.ntCreateThreadEx != 0 &&
+            out.ntQueryInformationProcess != 0 &&
+            out.ntAllocateVirtualMemory != 0 &&
+            out.ntFreeVirtualMemory != 0 &&
+            out.ntProtectVirtualMemory != 0 &&
+            out.ntDuplicateObject != 0;
+    }
+
+    void InitializeSyscallNumbers(const NtRoutines& nt) {
+        g_ntOpen = nt.ntOpenProcess;
+        g_ssn = GetSSN(nt.ntOpenProcess, kZwFunctionStub);
+        g_ssn_read = GetSSN(nt.ntReadVirtualMemory, kZwFunctionStub);
+        g_ssn_write = GetSSN(nt.ntWriteVirtualMemory, kZwFunctionStub);
+        g_ssn_QSI = GetSSN(nt.ntQuerySystemInformation, kZwFunctionStub);
+        g_ssn_thread = GetSSN(nt.ntCreateThreadEx, kZwFunctionStub);
+        g_ssn_QIP = GetSSN(nt.ntQueryInformationProcess, kZwFunctionStub);
+        g_ssn_allocate = GetSSN(nt.ntAllocateVirtualMemory, kZwFunctionStub);
+        g_ssn_free = GetSSN(nt.ntFreeVirtualMemory, kZwFunctionStub);
+        g_ssn_protect = GetSSN(nt.ntProtectVirtualMemory, kZwFunctionStub);
+        g_ssn_duplicate = GetSSN(nt.ntDuplicateObject, kZwFunctionStub);
+    }
+
+    bool EnableDebugPrivilege() {
+        HANDLE hToken = nullptr;
+        LUID luid{};
+        TOKEN_PRIVILEGES tp{};
+
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+            return false;
+
+        if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+            CloseHandle(hToken);
+            return false;
+        }
+
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr)) {
+            CloseHandle(hToken);
+            return false;
+        }
+
         CloseHandle(hToken);
+        return true;
+    }
+
+    bool ResolveNtdllFromPeb() {
+        NTDLL::ldr = *reinterpret_cast<uintptr_t*>(pebBase + 0x18);
+        const uintptr_t anchor = NTDLL::ldr + 0x10;
+        uintptr_t current = *reinterpret_cast<uintptr_t*>(anchor);
+
+        do {
+            const uintptr_t bufferAddress = *reinterpret_cast<uintptr_t*>(current + 0x60);
+            if (bufferAddress != 0) {
+                const auto* dllName = reinterpret_cast<const wchar_t*>(bufferAddress);
+                if (_wcsicmp(dllName, L"ntdll.dll") == 0) {
+                    NTDLL::ntBase = *reinterpret_cast<uintptr_t*>(current + 0x30);
+                    break;
+                }
+            }
+            current = *reinterpret_cast<uintptr_t*>(current);
+        } while (current != anchor);
+
+        return NTDLL::ntBase != 0;
+    }
+
+    DWORD FindProcessIdByName(const wchar_t* imageName) {
+        ULONG size = 0;
+        Syscall_NtQuerySystemInformation(SystemProcessInformation, nullptr, 0, &size);
+
+        void* buffer = std::malloc(static_cast<size_t>(size));
+        if (!buffer)
+            return 0;
+
+        Syscall_NtQuerySystemInformation(SystemProcessInformation, buffer, size, &size);
+
+        auto* walk = static_cast<PSYSTEM_PROCESS_INFORMATION>(buffer);
+        DWORD pid = 0;
+
+        for (;;) {
+            if (walk->ImageName.Buffer != nullptr && _wcsicmp(walk->ImageName.Buffer, imageName) == 0) {
+                pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(walk->UniqueProcessId));
+                break;
+            }
+            if (walk->NextEntryOffset == 0)
+                break;
+            walk = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(reinterpret_cast<uintptr_t>(walk) + walk->NextEntryOffset);
+        }
+
+        std::free(buffer);
+        return pid;
+    }
+
+    bool QuerySystemHandlesWithGrowableBuffer(PVOID& buffer, SIZE_T& byteSize) {
+        for (;;) {
+            if (buffer == nullptr) {
+                Syscall_NtAllocateVirtualMemory(reinterpret_cast<HANDLE>(-1), &buffer, 0, &byteSize,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            }
+
+            const NTSTATUS st =
+                Syscall_NtQuerySystemInformation(SystemExtendedHandleInformation, buffer,
+                    static_cast<ULONG>(byteSize), nullptr);
+            if (st == 0)
+                return true;
+
+            if (st == kNtStatusBufferTooSmall) {
+                SIZE_T freed = 0;
+                Syscall_NtFreeVirtualMemory(reinterpret_cast<HANDLE>(-1), &buffer, &freed, MEM_RELEASE);
+                buffer = nullptr;
+                byteSize += 1024 * 256;
+                continue;
+            }
+
+            return false;
+        }
+    }
+
+    void FreeAllocation(PVOID& ptr) {
+        if (!ptr)
+            return;
+        SIZE_T freed = 0;
+        Syscall_NtFreeVirtualMemory(reinterpret_cast<HANDLE>(-1), &ptr, &freed, MEM_RELEASE);
+        ptr = nullptr;
+    }
+
+    uintptr_t FindRemoteModuleBase(HANDLE hProcess, uintptr_t remoteLdr, const wchar_t* moduleName) {
+        const uintptr_t listHead = remoteLdr + 0x10;
+        uintptr_t currentEntry = 0;
+        NTSTATUS readSt =
+            Syscall_NtReadVirtualMemory(hProcess, reinterpret_cast<PVOID>(listHead), &currentEntry, sizeof(currentEntry), nullptr);
+        if (readSt != 0)
+            return 0;
+
+        while (currentEntry != listHead) {
+            LDR_DATA_TABLE_ENTRY entry{};
+            readSt = Syscall_NtReadVirtualMemory(hProcess, reinterpret_cast<PVOID>(currentEntry), &entry, sizeof(entry), nullptr);
+            if (readSt != 0)
+                break;
+
+            const uintptr_t nextEntry = reinterpret_cast<uintptr_t>(entry.InLoadOrderLinks.Flink);
+
+            wchar_t* nameBuf = static_cast<wchar_t*>(std::malloc(entry.BaseDllName.Length + sizeof(wchar_t)));
+            if (nameBuf) {
+                readSt = Syscall_NtReadVirtualMemory(hProcess, entry.BaseDllName.Buffer, nameBuf, entry.BaseDllName.Length, nullptr);
+                if (readSt == 0) {
+                    nameBuf[entry.BaseDllName.Length / sizeof(wchar_t)] = L'\0';
+                    if (_wcsicmp(moduleName, nameBuf) == 0) {
+                        const uintptr_t base = reinterpret_cast<uintptr_t>(entry.DllBase);
+                        std::free(nameBuf);
+                        return base;
+                    }
+                }
+                std::free(nameBuf);
+            }
+
+            if (nextEntry == 0)
+                break;
+            currentEntry = nextEntry;
+        }
+
+        return 0;
+    }
+
+    bool ResolveProcessObjectTypeIndex(USHORT& outIndex) {
+        HANDLE hSelf = nullptr;
+        CLIENT_ID selfCid = { reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(GetMyProcessId())), nullptr };
+        OBJECT_ATTRIBUTES selfOa = { sizeof(selfOa) };
+        selfOa.Length = sizeof(OBJECT_ATTRIBUTES);
+
+        const NTSTATUS openSelf =
+            Syscall_NtOpenProcess(&hSelf, PROCESS_QUERY_LIMITED_INFORMATION, &selfOa, &selfCid);
+        if (openSelf != 0 || !hSelf)
+            return false;
+
+        PVOID handleBuf = nullptr;
+        SIZE_T handleBufSize = 1024 * 1024;
+        if (!QuerySystemHandlesWithGrowableBuffer(handleBuf, handleBufSize)) {
+            CloseHandle(hSelf);
+            FreeAllocation(handleBuf);
+            return false;
+        }
+
+        auto* info = static_cast<PSYSTEM_HANDLE_INFORMATION_EX>(handleBuf);
+        const ULONG_PTR myPid = static_cast<ULONG_PTR>(GetMyProcessId());
+        const HANDLE selfVal = hSelf;
+
+        for (ULONG i = 0; i < info->NumberOfHandles; ++i) {
+            const SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX& e = info->Handles[i];
+            if (e.UniqueProcessId == myPid && reinterpret_cast<HANDLE>(e.HandleValue) == selfVal) {
+                outIndex = e.ObjectTypeIndex;
+                CloseHandle(hSelf);
+                FreeAllocation(handleBuf);
+                return true;
+            }
+        }
+
+        CloseHandle(hSelf);
+        FreeAllocation(handleBuf);
         return false;
     }
 
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    bool TryDuplicateFullControlHandle(
+        HANDLE hDonor,
+        PSYSTEM_HANDLE_INFORMATION_EX globalHandles,
+        DWORD donorPid,
+        DWORD targetPid,
+        USHORT processTypeIndex,
+        const wchar_t* candidateName,
+        HANDLE& ioProcess) {
 
-    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
-        CloseHandle(hToken);
+        for (ULONG i = 0; i < globalHandles->NumberOfHandles; ++i) {
+            const SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX& entry = globalHandles->Handles[i];
+
+            if (entry.UniqueProcessId != static_cast<ULONG_PTR>(donorPid) || entry.ObjectTypeIndex != processTypeIndex)
+                continue;
+
+            if (entry.GrantedAccess != kProcessFullControl)
+                continue;
+
+            HANDLE duplicated = nullptr;
+            const NTSTATUS dupSt = Syscall_NtDuplicateObject(
+                hDonor, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(entry.HandleValue)),
+                reinterpret_cast<HANDLE>(-1), &duplicated, 0, 0, kDuplicateSameAccess);
+
+            if (dupSt != 0) {
+                if (duplicated)
+                    CloseHandle(duplicated);
+                continue;
+            }
+
+            PROCESS_BASIC_INFORMATION pbi{};
+            const NTSTATUS qipSt = Syscall_NtQueryInformationProcess(duplicated, 0, &pbi, sizeof(pbi), nullptr);
+
+            if (qipSt == 0 && pbi.UniqueProcessId == static_cast<ULONG_PTR>(targetPid)) {
+                ioProcess = duplicated;
+                return true;
+            }
+
+            CloseHandle(duplicated);
+        }
+
         return false;
     }
 
-    CloseHandle(hToken);
-    return true;
-}
+} // namespace
+
+
 
 int main() {
     EnableDebugPrivilege();
     GetMyPeb();
     if (pebBase == 0) {
-        printf("Ошибка: Не удалось получить PEB!\n");
-        return 1;
-    }
-    
-    // Retrieve NTDLL module base address by walking the PEB's module list
-    NTDLL::ldr = *(uintptr_t*)(pebBase + 0x18);
-    uintptr_t anchor = (NTDLL::ldr + 0x10);
-    uintptr_t current = *(uintptr_t*)anchor;
-    do {
-        uintptr_t bufferAddress = *(uintptr_t*)(current + 0x60);
-        if (bufferAddress != 0) {
-            wchar_t* dllName = (wchar_t*)bufferAddress;
-            if (_wcsicmp(dllName, L"ntdll.dll") == 0) {
-                NTDLL::ntBase = *(uintptr_t*)(current + 0x30);
-                break;
-            }
-        }
-        current = *(uintptr_t*)current;
-    } while (current != anchor);
-    
-    if (NTDLL::ntBase != 0) {
-        printf("NTDLL Found at: %p\n", (void*)NTDLL::ntBase);
-    }
-    else {
-        printf("NTDLL not found!\n");
-    }
-    
-    // Verify NTDLL signature (MZ header)
-    unsigned short target = *(unsigned short*)NTDLL::ntBase;
-    if (target == 0x5A4D) {
-        printf("Signature confirmed: MZ is here!\n");
-    }
-    else {
-        printf("????\n");
-    }
-    
-    // Resolve native API function addresses using hash-based lookup
-    uintptr_t ntOpen = GetFunctionAddress(0x3F4DD136);
-    uintptr_t pNtRead = GetFunctionAddress(0x307C3661);
-    uintptr_t pNtWrite = GetFunctionAddress(0xFAE162D0);
-
-    uintptr_t pNtSysInfo = GetFunctionAddress(0x684921E6);
-    uintptr_t pNtCreateThreadEx = GetFunctionAddress(0xFE3E696E);
-    uintptr_t pNtQueryInformationProcess = GetFunctionAddress(0xA405E60);
-
-    uintptr_t pNtVirtualAllocEx = GetFunctionAddress(0xC86105CA);
-    uintptr_t pNtVirtualFreeEx = GetFunctionAddress(0xB5567B67);
-    uintptr_t NtProtectVirtualEx = GetFunctionAddress(0xA4D0D586);
-
-    uintptr_t NtDuplicate = GetFunctionAddress(0x781AA9F7);
-
-    // Cast function pointers for calling
-    f_NtOpenProcess _NtOpenProcess;
-    f_NtReadVirtualMemory _NtReadVirtualMemory;
-    f_NtWriteVirtualMemory _NtWriteVirtualMemory;
-    f_NtQuerySystemInformation _NtQuerySystemInformation;
-
-    _NtOpenProcess = (f_NtOpenProcess)ntOpen;
-    _NtReadVirtualMemory = (f_NtReadVirtualMemory)pNtRead;
-    _NtWriteVirtualMemory = (f_NtWriteVirtualMemory)pNtWrite;
-    _NtQuerySystemInformation = (f_NtQuerySystemInformation)pNtSysInfo;
-
-    // Enumerate processes to find target CS2 (Counter-Strike 2)
-    ULONG bufferSize = 0;
-    _NtQuerySystemInformation(SystemProcessInformation, NULL, 0, &bufferSize);
-    void* buffer = malloc(size_t(bufferSize));
-    _NtQuerySystemInformation(SystemProcessInformation, buffer, bufferSize, &bufferSize);
-
-    PSYSTEM_PROCESS_INFORMATION pCurrent = (PSYSTEM_PROCESS_INFORMATION)buffer;
-    DWORD targetPid = 0;
-
-    while (true) {
-        if (pCurrent->ImageName.Buffer != NULL) {
-            if (_wcsicmp(pCurrent->ImageName.Buffer, L"cs2.exe") == 0) {
-                targetPid = (DWORD)pCurrent->UniqueProcessId;
-                break;
-            }
-        }
-        if (pCurrent->NextEntryOffset == 0)
-            break;
-        pCurrent = (PSYSTEM_PROCESS_INFORMATION)((uintptr_t)pCurrent + pCurrent->NextEntryOffset);
-    }
-    free(buffer);
-
-    // Initialize client ID and object attributes for target process
-    CLIENT_ID cid = { 0 };
-    cid.UniqueProcess = (HANDLE)(uintptr_t)targetPid;
-    cid.UniqueThread = 0;
-
-    OBJECT_ATTRIBUTES oa;
-    oa.Length = sizeof(OBJECT_ATTRIBUTES);
-    oa.RootDirectory = NULL;
-    oa.Attributes = 0;
-    oa.ObjectName = NULL;
-    oa.SecurityDescriptor = NULL;
-    oa.SecurityQualityOfService = NULL;
-
-    // Extract and store System Service Numbers (SSNs) for indirect syscalls
-    g_ntOpen = ntOpen;
-    g_ssn = GetSSN(ntOpen, expected);
-    g_ssn_read = GetSSN(pNtRead, expected);
-    g_ssn_write = GetSSN(pNtWrite, expected);
-
-    g_ssn_QSI = GetSSN(pNtSysInfo, expected);
-    g_ssn_thread = GetSSN(pNtCreateThreadEx, expected);
-    g_ssn_QIP = GetSSN(pNtQueryInformationProcess, expected);
-
-    g_ssn_allocate = GetSSN(pNtVirtualAllocEx, expected);
-    g_ssn_free = GetSSN(pNtVirtualFreeEx, expected);
-    g_ssn_protect = GetSSN(NtProtectVirtualEx, expected);
-    printf("[*] Real hash for NtDuplicateObject: %X\n", MyHasher("NtDuplicateObject"));
-
-    if (NtDuplicate == 0) {
-        printf("[-] Error: Could not find NtDuplicateObject by hash!\n");
+        std::printf("Ошибка: Не удалось получить PEB!\n");
         return 1;
     }
 
-    g_ssn_duplicate = GetSSN(NtDuplicate, expected);
-    printf("[+] NtDuplicateObject SSN: %d\n", g_ssn_duplicate);
+    if (!ResolveNtdllFromPeb())
+        return 1;
 
+    NtRoutines nt{};
+    if (!ResolveNtRoutines(nt)) {
+        std::printf("[-] Failed to resolve one or more Nt* routines.\n");
+        return 1;
+    }
+    InitializeSyscallNumbers(nt);
 
-    DWORD dwDesiredAccess = 0x0438;
-    HANDLE hProcess = 0;
-    NTSTATUS status = Syscall_NtOpenProcess(&hProcess, dwDesiredAccess, &oa, &cid);
+    const uintptr_t ntDuplicate = nt.ntDuplicateObject;
+    (void)ntDuplicate;
 
-    // Query remote process PEB (Process Environment Block) to locate module list
-    PROCESS_BASIC_INFORMATION pbi;
-    NTSTATUS qipStatus = Syscall_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), NULL);
+    const DWORD targetPid = FindProcessIdByName(L"cs2.exe");
+    if (targetPid == 0) {
+        std::printf("[-] cs2.exe not found.\n");
+        return 1;
+    }
+
+    CLIENT_ID cid = {};
+    cid.UniqueProcess = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(targetPid));
+    cid.UniqueThread = nullptr;
+
+    OBJECT_ATTRIBUTES oa = {};
+    oa.Length = sizeof(oa);
+
+    HANDLE hProcess = nullptr;
+    Syscall_NtOpenProcess(&hProcess, kOpenProcessDesiredAccess, &oa, &cid);
+
+    PROCESS_BASIC_INFORMATION pbi{};
+    Syscall_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), nullptr);
+
     uintptr_t remoteLdr = 0;
-    NTSTATUS readStatus = Syscall_NtReadVirtualMemory(hProcess, (PVOID)((uintptr_t)pbi.PebBaseAddress + 0x18), &remoteLdr, sizeof(remoteLdr), NULL);
-    if (readStatus == 0) {
-        printf("[+] Ldr found at: %p\n", (void*)remoteLdr);
-    }
+    NTSTATUS readSt = Syscall_NtReadVirtualMemory(
+        hProcess, reinterpret_cast<PVOID>(reinterpret_cast<uintptr_t>(pbi.PebBaseAddress) + 0x18),
+        &remoteLdr, sizeof(remoteLdr), nullptr);
+    (void)readSt;
 
-    // Walk the LDR (Loader Data Table) to find client.dll
-    uintptr_t listHeadAddr = remoteLdr + 0x10;
-    uintptr_t currentEntry = 0;
-    readStatus = Syscall_NtReadVirtualMemory(hProcess, (PVOID)listHeadAddr, &currentEntry, sizeof(currentEntry), NULL);
-    uintptr_t clientBase = 0;
+    const uintptr_t clientBase = FindRemoteModuleBase(hProcess, remoteLdr, L"client.dll");
+    (void)clientBase;
 
-    while (currentEntry != listHeadAddr) {
-        LDR_DATA_TABLE_ENTRY entry;
-        readStatus = Syscall_NtReadVirtualMemory(hProcess, (PVOID)currentEntry, &entry, sizeof(entry), NULL);
-        if (readStatus == 0) {
-            wchar_t* dllName = (wchar_t*)malloc(entry.BaseDllName.Length + sizeof(wchar_t));
-            if (dllName) {
-                readStatus = Syscall_NtReadVirtualMemory(hProcess, entry.BaseDllName.Buffer, dllName, entry.BaseDllName.Length, NULL);
-                if (readStatus == 0) {
-                    dllName[entry.BaseDllName.Length / sizeof(wchar_t)] = L'\0';
-                    if (_wcsicmp(L"client.dll", dllName) == 0) {
-                        clientBase = (uintptr_t)entry.DllBase;
-                        printf("[+] client.dll found at: %p\n", entry.DllBase);
-                        free(dllName);
-                        break;
-                    }
-                }
-                free(dllName);
-            }
-        }
-        currentEntry = (uintptr_t)entry.InLoadOrderLinks.Flink;
-        if (currentEntry == 0) break;
-    }
-    
-    // Allocate memory for system handle table (with retry logic for buffer size)
-    PVOID Alloc_buff = NULL;
-    SIZE_T size = 1024 * 1024;
-    NTSTATUS AllocStatus = Syscall_NtAllocateVirtualMemory(INVALID_HANDLE_VALUE, &Alloc_buff, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-    if (AllocStatus == 0) {
-        printf("[+] Memory allocated at: %p\n", Alloc_buff);
-    }
-    else {
-        printf("Memory allocation failed! Status: %X\n", AllocStatus);
-    }
-
-    // Query SystemExtendedHandleInformation with dynamic buffer sizing
-    while (true) {
-        if (Alloc_buff == nullptr) {
-            Syscall_NtAllocateVirtualMemory((HANDLE)-1, &Alloc_buff, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        }
-        NTSTATUS status = Syscall_NtQuerySystemInformation(SystemExtendedHandleInformation, Alloc_buff, (ULONG)size, NULL);
-
-        if (status == 0) {
-            break;
-        }
-
-        if (status == 0xC0000004) {
-            SIZE_T freeSize = 0;
-            Syscall_NtFreeVirtualMemory((HANDLE)-1, &Alloc_buff, &freeSize, MEM_RELEASE);
-
-            Alloc_buff = nullptr;
-            size += 1024 * 256;
-            continue;
-        }
-        printf("Unexpected error: %X\n", status);
+    PVOID handleTableBuffer = nullptr;
+    SIZE_T handleTableSize = 1024 * 1024;
+    if (!QuerySystemHandlesWithGrowableBuffer(handleTableBuffer, handleTableSize)) {
+        FreeAllocation(handleTableBuffer);
         return 1;
     }
 
-    PSYSTEM_HANDLE_INFORMATION_EX handleInfo = (PSYSTEM_HANDLE_INFORMATION_EX)Alloc_buff;
-    printf("[+] Number of handles: %d\n", handleInfo->NumberOfHandles);
-    for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
-        SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX handleEntry = handleInfo->Handles[i];
-        if (handleEntry.UniqueProcessId == targetPid) {
+    auto* const globalHandles = static_cast<PSYSTEM_HANDLE_INFORMATION_EX>(handleTableBuffer);
 
-        }
-    }
-    DWORD myPid = GetMyProcessId();
-    printf("[*] My Stealthy PID: %d\n", myPid);
+    const DWORD myPid = GetMyProcessId();
 
-    // Get all process information for donor process search
-    PVOID buffer1 = NULL; 
-    ULONG bufferSize1 = 0;
+    ULONG procListSize = 0;
+    Syscall_NtQuerySystemInformation(SystemProcessInformation, nullptr, 0, &procListSize);
+    procListSize += 0x2000;
 
-    _NtQuerySystemInformation(SystemProcessInformation, NULL, 0, &bufferSize1);
-    bufferSize1 += 0x2000; 
-    SIZE_T size1 = (SIZE_T)bufferSize1;
+    PVOID procListBuffer = nullptr;
+    SIZE_T procListAlloc = static_cast<SIZE_T>(procListSize);
+    const NTSTATUS allocProc = Syscall_NtAllocateVirtualMemory(reinterpret_cast<HANDLE>(-1), &procListBuffer, 0,
+        &procListAlloc, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-    NTSTATUS status1 = Syscall_NtAllocateVirtualMemory((HANDLE)-1, &buffer1, 0, &size1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     USHORT processTypeIndex = 0;
-    HANDLE hSelf = NULL;
-    
-    // Open our own process to determine the process type index from system handle table
-    CLIENT_ID selfCid = { (HANDLE)GetCurrentProcessId(), 0 };
-    OBJECT_ATTRIBUTES selfOa = { sizeof(selfOa) };
-    selfOa.Length = sizeof(OBJECT_ATTRIBUTES);
-
-    _NtOpenProcess(&hSelf, PROCESS_QUERY_LIMITED_INFORMATION, &selfOa, &selfCid);
-
-    // Query handle table again to find process type index
-    PVOID Alloc_buff2 = NULL;
-    SIZE_T hTableSize = 1024 * 1024;
-
-    while (true) {
-        if (Alloc_buff2 == nullptr) {
-            Syscall_NtAllocateVirtualMemory((HANDLE)-1, &Alloc_buff2, 0, &hTableSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        }
-        NTSTATUS status = Syscall_NtQuerySystemInformation(SystemExtendedHandleInformation, Alloc_buff2, (ULONG)hTableSize, NULL);
-
-        if (status == 0) break;
-
-        if (status == 0xC0000004) { // Buffer Too Small
-            SIZE_T freeSize = 0;
-            Syscall_NtFreeVirtualMemory((HANDLE)-1, &Alloc_buff2, &freeSize, MEM_RELEASE);
-            Alloc_buff2 = nullptr;
-            hTableSize += 1024 * 256;
-            continue;
-        }
+    if (!ResolveProcessObjectTypeIndex(processTypeIndex)) {
+        std::printf("[-] CRITICAL ERROR: Index not found! Check Admin permissions..\n");
+        FreeAllocation(handleTableBuffer);
+        FreeAllocation(procListBuffer);
         return 1;
     }
 
-    PSYSTEM_HANDLE_INFORMATION_EX handleInfo1 = (PSYSTEM_HANDLE_INFORMATION_EX)Alloc_buff2;
+    if (allocProc == 0) {
+        NTSTATUS qsiProc =
+            Syscall_NtQuerySystemInformation(SystemProcessInformation, procListBuffer, procListSize, &procListSize);
+        (void)qsiProc; // donor sweep runs even if first QSI is flaky
 
-    // Locate our handle in the system table to determine process object type index
-    if (hSelf) {
-        for (ULONG i = 0; i < handleInfo1->NumberOfHandles; i++) {
+        static const wchar_t* const kDonors[] = {
+            L"csrss.exe", L"lsass.exe", L"Steam.exe", L"Discord.exe", L"svchost.exe",
+        };
 
-            if (handleInfo1->Handles[i].UniqueProcessId == GetCurrentProcessId() &&
-                (HANDLE)handleInfo1->Handles[i].HandleValue == hSelf) {
-                processTypeIndex = handleInfo1->Handles[i].ObjectTypeIndex;
-                printf("[*] PROCESS TYPE INDEX DEFINED: %d\n", processTypeIndex);
+        bool duplicated = false;
+
+        for (const wchar_t* donorName : kDonors) {
+            if (duplicated)
                 break;
-            }
-        }
-        CloseHandle(hSelf); 
-    }
 
-    if (processTypeIndex == 0) {
-        printf("[-] CRITICAL ERROR: Index not found! Check Admin permissions..\n");
-        return 1;
-    }
-    
-    DWORD donorPid = 0;
-    HANDLE hDonor = NULL;
-    HANDLE hStolen = NULL;
+            auto* scan = static_cast<PSYSTEM_PROCESS_INFORMATION>(procListBuffer);
+            for (;;) {
+                if (duplicated)
+                    break;
 
-    // Attempt to steal target process handle from donor processes
-    if (status1 == 0) {
-        status1 = _NtQuerySystemInformation(SystemProcessInformation, buffer1, bufferSize1, &bufferSize1);
+                if (scan->ImageName.Buffer && _wcsicmp(scan->ImageName.Buffer, donorName) == 0) {
+                    const DWORD donorPid =
+                        static_cast<DWORD>(reinterpret_cast<uintptr_t>(scan->UniqueProcessId));
 
-        PSYSTEM_PROCESS_INFORMATION pCurrent1 = (PSYSTEM_PROCESS_INFORMATION)buffer1;
+                    if (donorPid != myPid) {
+                        CLIENT_ID dCid = { reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(donorPid)), nullptr };
+                        OBJECT_ATTRIBUTES dOa = { sizeof(dOa) };
 
-        // Candidate donor processes with high privilege/accessibility
-        const wchar_t* candidates[] = { L"csrss.exe", L"lsass.exe", L"Steam.exe", L"Discord.exe", L"svchost.exe" };
-  
-        for (const wchar_t* name : candidates) {
-            DWORD currentDonorPid = 0;
-
-            PSYSTEM_PROCESS_INFORMATION pScan = (PSYSTEM_PROCESS_INFORMATION)buffer1;
-            while (true) {
-                if (pScan->ImageName.Buffer && _wcsicmp(pScan->ImageName.Buffer, name) == 0) {
-
-                    currentDonorPid = (DWORD)(uintptr_t)pScan->UniqueProcessId;
-
-                    if (currentDonorPid == myPid) goto next_candidate;
-
-                    CLIENT_ID dCid = { (HANDLE)currentDonorPid, 0 };
-                    OBJECT_ATTRIBUTES dOa = { sizeof(dOa) };
-
-                    if (Syscall_NtOpenProcess(&hDonor, PROCESS_DUP_HANDLE, &dOa, &dCid) == 0) {
-                        // Search donor's handle table for target process handles
-                        for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
-                            auto& entry = handleInfo->Handles[i];
-                            ACCESS_MASK myAccess = 0x10 | 0x0400 | 0x0008;
-                            
-                            // Duplicate target process handle from donor
-                            if (entry.UniqueProcessId == (ULONG_PTR)currentDonorPid && entry.ObjectTypeIndex == processTypeIndex) {
-                                HANDLE hStolen = NULL;
-                               
-                                if (Syscall_NtDuplicateObject(hDonor, (HANDLE)entry.HandleValue, (HANDLE)-1, &hStolen, 0, 0, myAccess) == 0) {
-                                    PROCESS_BASIC_INFORMATION pbi;
-                                    // Verify the stolen handle points to our target CS2 process
-                                    if (Syscall_NtQueryInformationProcess(hStolen, 0, &pbi, sizeof(pbi), NULL) == 0) {
-                                        if (pbi.UniqueProcessId == (ULONG_PTR)targetPid) {
-                                            printf("\n[+] DOMINATION! Хендл угнан у %ws! (Handle: %p)\n", name, hStolen);
-                                            hProcess = hStolen;
-                                            CloseHandle(hDonor);
-                                            goto success;
-                                        }
-                                    }
-                                    CloseHandle(hStolen);
-                                }
+                        HANDLE hDonor = nullptr;
+                        if (Syscall_NtOpenProcess(&hDonor, PROCESS_DUP_HANDLE, &dOa, &dCid) == 0 && hDonor) {
+                            HANDLE previous = hProcess;
+                            if (TryDuplicateFullControlHandle(hDonor, globalHandles, donorPid, targetPid,
+                                processTypeIndex, donorName, hProcess)) {
+                                if (previous)
+                                    CloseHandle(previous);
+                                duplicated = true;
+                                CloseHandle(hDonor);
+                                break;
                             }
+                            CloseHandle(hDonor);
                         }
-                        CloseHandle(hDonor);
                     }
                 }
-            next_candidate:
-                if (pScan->NextEntryOffset == 0) break;
-                pScan = (PSYSTEM_PROCESS_INFORMATION)((uintptr_t)pScan + pScan->NextEntryOffset);
+
+                if (scan->NextEntryOffset == 0)
+                    break;
+                scan = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(
+                    reinterpret_cast<uintptr_t>(scan) + scan->NextEntryOffset);
             }
         }
     }
-    
-    // Validate the stolen handle
-    success:
-    if (hProcess != NULL) {
-        printf("\n[CHECK] Checking a borrowed handle...\n");
-        printf("[*] The meaning of the handle in your process: %p\n", hProcess);
 
-        PROCESS_BASIC_INFORMATION pbi_check;
-        // Verify handle integrity and target process
-        if (Syscall_NtQueryInformationProcess(hProcess, 0, &pbi_check, sizeof(pbi_check), NULL) == 0) {
-            printf("[*] Handle points to PID: %d\n", (DWORD)pbi_check.UniqueProcessId);
+    FreeAllocation(procListBuffer);
+    FreeAllocation(handleTableBuffer);
 
-            if ((DWORD)pbi_check.UniqueProcessId == targetPid) {
-                printf("[STATUS] FULL GOOD! PID matches CS2.\n");
-            }
-            else {
-                printf("[STATUS] STOP! PID does not match.\n");
-            }
-        }
-        
-        // Test memory read access on target process
-        unsigned short mz_check = 0;
-        if (Syscall_NtReadVirtualMemory(hProcess, (PVOID)clientBase, &mz_check, sizeof(mz_check), NULL) == 0) {
-            if (mz_check == 0x5A4D) { // 'MZ'
-                printf("[STATUS] Memory Reading: WORKING! (Found the MZ header)\n");
-            }
-        }
-        else {
-            printf("[STATUS] Memory read: ERROR. Handle does not have read permission..\n");
-        }
-    }
-
-    // Clean up allocated memory
-    SIZE_T freeSize = 0;
-    Syscall_NtFreeVirtualMemory((HANDLE)-1, &buffer1, &freeSize, MEM_RELEASE);
-  
-    if (Alloc_buff) {
-        SIZE_T freeSize = 0;
-        Syscall_NtFreeVirtualMemory((HANDLE)-1, &Alloc_buff, &freeSize, MEM_RELEASE);
-    }
-
-    // Ready for game data reading/writing via stolen handle
-    //Read<uintptr_t>(hProcess, clientBase + offsets);
-    //Write<bool>(hProcess, targetAddress(client+offsets), our bool) 
-
-    while (!GetAsyncKeyState(VK_DELETE)) {}
+   
     return 0;
 }
